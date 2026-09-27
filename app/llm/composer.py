@@ -8,7 +8,12 @@ from app.core.opportunity_engine import Opportunity, OpportunityType
 from app.retrieval.structured_retriever import GroundedContext
 from app.llm.ollama_client import OllamaProvider
 
-FROM_SYSTEM_PROMPT = """You are Vera, a merchant-facing AI assistant. You compose WhatsApp messages for Merchants (Indian businesses). Never invent facts. Only use provided facts. Be concise. Return STRICT JSON: {"body": str, "cta": str}"""
+import threading
+import time
+
+LLM_SEMAPHORE = threading.Semaphore(1)
+
+FROM_SYSTEM_PROMPT = "You are Vera. Write a short WhatsApp msg for this merchant based on facts. Return STRICT JSON: {\"body\": \"msg\", \"cta\": \"type\"}"
 
 class MessageCompose(BaseModel):
     body: str
@@ -29,27 +34,22 @@ class Composer:
         self.llm = llm_provider
     
     def compose(self, grounded: GroundedContext, cta_instruction: str = "open_ended", opportunity_type: str = "") -> MessageCompose:
-        system_prompt = FROM_SYSTEM_PROMPT
-        facts_text = "\n".join([f"- {f.text}" for f in grounded.facts])
-        
-        user_prompt = f"""Compose a WhatsApp message using ONLY these facts:
-{facts_text}
-
-Trigger: {grounded.trigger.kind}
-Opportunity: {opportunity_type}
-CTA Type: {cta_instruction}
-
-JSON output format: {{"body": "...", "cta": "..."}}"""
-        
+        if not LLM_SEMAPHORE.acquire(timeout=5.0):
+            return self._fallback_compose(grounded, cta_instruction, opportunity_type)
+            
         try:
+            facts = " ".join([f.text for f in grounded.facts])
+            owner = grounded.merchant.identity.owner_first_name or grounded.merchant.identity.name
+            
+            prompt = f"Merchant:{owner}, Category:{grounded.category.slug}, Trigger:{grounded.trigger.kind}, Opp:{opportunity_type}, Facts:{facts}, CTA:{cta_instruction}. Write JSON."
+            
             response = self.llm.generate(
-                prompt=user_prompt,
-                system=system_prompt,
+                prompt=prompt,
+                system=FROM_SYSTEM_PROMPT,
                 temperature=0.0,
-                max_tokens=200
+                max_tokens=100
             )
             
-            # Parse JSON response
             import json
             if response.startswith("```json"): response = response[7:]
             elif response.startswith("```"): response = response[3:]
@@ -62,9 +62,10 @@ JSON output format: {{"body": "...", "cta": "..."}}"""
                 rationale="LLM composition successful",
                 claims=[]
             )
-        except Exception as e:
-            # Fallback to deterministic composition
+        except Exception:
             return self._fallback_compose(grounded, cta_instruction, opportunity_type)
+        finally:
+            LLM_SEMAPHORE.release()
     
     def _fallback_compose(self, grounded: GroundedContext, cta_instruction: str, opportunity_type: str) -> MessageCompose:
         m = grounded.merchant

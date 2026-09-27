@@ -172,7 +172,7 @@ async def push_context(body: ContextPushBody):
     }
 
 @app.post("/v1/tick", response_model=TickResponse)
-async def tick(body: TickBody):
+def tick(body: TickBody):
     actions = []
     
     for trigger_id in body.available_triggers:
@@ -269,7 +269,7 @@ def map_trigger_to_opportunity(trigger_kind: str) -> OpportunityType:
     return trigger_kind_to_opportunity_type(trigger_kind)
 
 @app.post("/v1/reply", response_model=ReplyResponse)
-async def reply(body: ReplyBody):
+def reply(body: ReplyBody):
     """
     Handle merchant reply via LangGraph conversation orchestration.
     Intent routing: interested → action_flow, stop → graceful_exit,
