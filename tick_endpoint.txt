@@ -1,0 +1,87 @@
+async def tick(body: TickBody):
+    actions = []
+    
+    for trigger_id in body.available_triggers:
+        trigger_key = f"trigger:{trigger_id}"
+        if trigger_key not in raw_contexts:
+            continue
+        
+        trigger = raw_contexts[trigger_key]
+        merchant_id = trigger.get("merchant_id")
+        customer_id = trigger.get("customer_id")
+        
+        if not merchant_id:
+            continue
+        
+        opp_type = map_trigger_to_opportunity(trigger.get("kind", ""))
+        should_suppress, reason = suppression.should_suppress(merchant_id, trigger_id, opp_type.value, "")
+        if should_suppress:
+            continue
+        
+        normalized = context_store.get(merchant_id)
+        if not normalized:
+            category_slug = raw_contexts.get(f"merchant:{merchant_id}", {}).get("category_slug")
+            if category_slug:
+                category_key = f"category:{category_slug}"
+                if category_key in raw_contexts:
+                    normalized = normalizer.normalize(
+                        category=raw_contexts[category_key],
+                        merchant=raw_contexts[merchant_key],
+                        trigger=trigger,
+                        customer=raw_contexts.get(f"customer:{customer_id}") if customer_id else None
+                    )
+                    fact_ledger.extract_from_context(normalized)
+                    normalized.facts = [f.fact_id for f in fact_ledger.get_verified_facts()]
+                    context_store[merchant_id] = normalized
+        
+        if not normalized:
+            continue
+        
+        context_store["normalized"] = normalized
+        
+        signals = signal_extractor.extract_signals(normalized)
+        
+        opportunity = opportunity_engine.select_best_opportunity(normalized, signals, suppression)
+        if not opportunity:
+            continue
+        
+        grounded = retriever.retrieve_for_opportunity(normalized, opportunity)
+        
+        composed = composer.compose(grounded, opportunity.value, trigger.get("kind", ""))
+        
+        validation = validator.validate(composed, grounded, [], composed.cta)
+        if not validation.valid:
+            composed = validator.repair(composed, grounded, composed.cta)
+            validation.fallback_used = True
+        
+        cta = cta_engine.select_cta(opportunity, trigger.get("scope", "merchant"))
+        
+        suppression.record_send(merchant_id, trigger_id, opportunity.value, composed.body, 
+                               datetime.fromisoformat(trigger.get("expires_at").replace("Z", "+00:00")) if trigger.get("expires_at") else None)
+        
+        conversation_id = f"conv_{merchant_id}_{trigger_id}_{int(datetime.now().timestamp())}"
+        
+        action = Action(
+            conversation_id=conversation_id,
+            merchant_id=merchant_id,
+            customer_id=customer_id,
+            send_as="merchant_on_behalf" if customer_id else "vera",
+            trigger_id=trigger_id,
+            template_name=f"vera_{trigger.get('kind', 'generic')}_v1",
+            template_params=[normalized.merchant.identity.owner_first_name or normalized.merchant.identity.name, 
+                           trigger.get("kind", ""), ""],
+            body=composed.body,
+            cta=cta.value,
+            suppression_key=trigger.get("suppression_key", ""),
+            rationale=composed.rationale
+        )
+        actions.append(action)
+        
+        state_manager.create_conversation(
+            merchant_id=merchant_id,
+            customer_id=customer_id,
+            opportunity=opportunity.value
+        )
+    
+    return TickResponse(actions=actions)
+
